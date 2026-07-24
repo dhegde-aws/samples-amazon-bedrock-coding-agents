@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Acceptance test for the cost-analyzer MCP server.
+
+Probes the live JSON-RPC 2.0 endpoint to verify:
+  - Discovery: tools/list returns all expected tools
+  - Correctness: tools/call with known inputs returns correct structured results
+  - Validation: invalid inputs produce JSON-RPC errors, not wrong answers
+"""
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+ENDPOINT = os.environ.get("MCP_ENDPOINT_URL", "http://127.0.0.1:50851")
+
+EXPECTED_TOOLS = [
+    "estimate_ec2_monthly_cost",
+    "estimate_ebs_monthly_cost",
+    "estimate_s3_monthly_cost",
+    "recommend_instance",
+    "estimate_stack_monthly_cost",
+]
+
+passed = 0
+failed = 0
+
+
+def rpc(method, params=None, req_id=1):
+    """Send a JSON-RPC 2.0 request and return the parsed response."""
+    payload = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        ENDPOINT,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def check(description, condition, detail=""):
+    global passed, failed
+    if condition:
+        passed += 1
+        print(f"PASS: {description}")
+    else:
+        failed += 1
+        msg = f"FAIL: {description}"
+        if detail:
+            msg += f" -- {detail}"
+        print(msg)
+
+
+# ---------- Discovery: tools/list ----------
+
+try:
+    resp = rpc("tools/list")
+except Exception as e:
+    print(f"FAIL: tools/list request failed: {e}")
+    sys.exit(1)
+
+check("tools/list returns a result", "result" in resp and "error" not in resp)
+
+tools = resp.get("result", {}).get("tools", [])
+tool_names = {t["name"] for t in tools}
+
+check(
+    f"tools/list returns all {len(EXPECTED_TOOLS)} expected tools",
+    all(name in tool_names for name in EXPECTED_TOOLS),
+    detail=f"missing: {set(EXPECTED_TOOLS) - tool_names}" if not all(name in tool_names for name in EXPECTED_TOOLS) else "",
+)
+
+for name in EXPECTED_TOOLS:
+    check(f"tool '{name}' present in tools/list", name in tool_names)
+
+# Verify each tool has description and inputSchema
+for t in tools:
+    if t["name"] in EXPECTED_TOOLS:
+        check(
+            f"tool '{t['name']}' has description and inputSchema",
+            bool(t.get("description")) and "inputSchema" in t,
+        )
+
+# ---------- Correctness: tools/call with known inputs ----------
+
+# Test estimate_ec2_monthly_cost
+resp = rpc("tools/call", {"name": "estimate_ec2_monthly_cost", "arguments": {"instance_type": "m5.large", "count": 2}})
+check("tools/call estimate_ec2_monthly_cost returns result (no error)", "result" in resp and "error" not in resp)
+content = resp.get("result", {}).get("content", [])
+check("estimate_ec2_monthly_cost result has content array", len(content) > 0)
+if content:
+    result_data = json.loads(content[0]["text"])
+    # m5.large is $0.096/hr, 730 hrs/month, 2 instances = 0.096 * 730 * 2 = 140.16
+    check(
+        "estimate_ec2_monthly_cost monthly_cost = 140.16 for 2x m5.large",
+        result_data.get("monthly_cost") == 140.16,
+        detail=f"got {result_data.get('monthly_cost')}",
+    )
+    check(
+        "estimate_ec2_monthly_cost returns correct instance_type",
+        result_data.get("instance_type") == "m5.large",
+    )
+    check(
+        "estimate_ec2_monthly_cost returns currency USD",
+        result_data.get("currency") == "USD",
+    )
+
+# Test estimate_ebs_monthly_cost
+resp = rpc("tools/call", {"name": "estimate_ebs_monthly_cost", "arguments": {"volume_type": "gp3", "size_gb": 100, "count": 1}})
+check("tools/call estimate_ebs_monthly_cost returns result", "result" in resp and "error" not in resp)
+content = resp.get("result", {}).get("content", [])
+if content:
+    result_data = json.loads(content[0]["text"])
+    # gp3 is $0.08/GB-month, 100 GB = 8.00
+    check(
+        "estimate_ebs_monthly_cost monthly_cost = 8.0 for 100GB gp3",
+        result_data.get("monthly_cost") == 8.0,
+        detail=f"got {result_data.get('monthly_cost')}",
+    )
+
+# Test estimate_s3_monthly_cost
+resp = rpc("tools/call", {"name": "estimate_s3_monthly_cost", "arguments": {"storage_gb": 500, "get_requests": 100000, "put_requests": 10000, "storage_class": "STANDARD"}})
+check("tools/call estimate_s3_monthly_cost returns result", "result" in resp and "error" not in resp)
+content = resp.get("result", {}).get("content", [])
+if content:
+    result_data = json.loads(content[0]["text"])
+    # storage: 0.023 * 500 = 11.5, GET: (100000/1000)*0.0004 = 0.04, PUT: (10000/1000)*0.005 = 0.05
+    # total = 11.5 + 0.04 + 0.05 = 11.59
+    check(
+        "estimate_s3_monthly_cost monthly_cost = 11.59 for 500GB STANDARD",
+        result_data.get("monthly_cost") == 11.59,
+        detail=f"got {result_data.get('monthly_cost')}",
+    )
+
+# Test recommend_instance
+resp = rpc("tools/call", {"name": "recommend_instance", "arguments": {"vcpus": 2, "memory_gib": 8}})
+check("tools/call recommend_instance returns result", "result" in resp and "error" not in resp)
+content = resp.get("result", {}).get("content", [])
+if content:
+    result_data = json.loads(content[0]["text"])
+    # m5.large has 2 vCPUs, 8 GiB at $0.096/hr => 70.08/month (cheapest meeting 2 vCPU + 8 GiB)
+    check(
+        "recommend_instance picks m5.large for vcpus=2, memory_gib=8",
+        result_data.get("recommended_instance_type") == "m5.large",
+        detail=f"got {result_data.get('recommended_instance_type')}",
+    )
+    check(
+        "recommend_instance monthly_cost = 70.08",
+        result_data.get("monthly_cost") == 70.08,
+        detail=f"got {result_data.get('monthly_cost')}",
+    )
+
+# Test estimate_stack_monthly_cost
+stack_spec = {
+    "ec2": [{"instance_type": "t3.micro", "count": 1}],
+    "ebs": [{"volume_type": "gp3", "size_gb": 50}],
+    "s3": [{"storage_gb": 100}],
+}
+resp = rpc("tools/call", {"name": "estimate_stack_monthly_cost", "arguments": {"spec": stack_spec}})
+check("tools/call estimate_stack_monthly_cost returns result", "result" in resp and "error" not in resp)
+content = resp.get("result", {}).get("content", [])
+if content:
+    result_data = json.loads(content[0]["text"])
+    # t3.micro: 0.0104 * 730 = 7.592 => 7.59
+    # gp3 50GB: 0.08 * 50 = 4.0
+    # S3 100GB STANDARD: 0.023 * 100 = 2.3
+    # total: 7.59 + 4.0 + 2.3 = 13.89
+    check(
+        "estimate_stack_monthly_cost has line_items",
+        len(result_data.get("line_items", [])) == 3,
+        detail=f"got {len(result_data.get('line_items', []))} line_items",
+    )
+    check(
+        "estimate_stack_monthly_cost total_monthly_cost = 13.89",
+        result_data.get("total_monthly_cost") == 13.89,
+        detail=f"got {result_data.get('total_monthly_cost')}",
+    )
+
+# ---------- Validation: invalid inputs produce JSON-RPC errors ----------
+
+# Unknown instance type
+resp = rpc("tools/call", {"name": "estimate_ec2_monthly_cost", "arguments": {"instance_type": "x99.nonexistent"}})
+check(
+    "invalid instance_type returns JSON-RPC error",
+    "error" in resp,
+    detail=f"got result instead of error" if "error" not in resp else "",
+)
+if "error" in resp:
+    check(
+        "error code is -32602 (invalid params) for bad instance_type",
+        resp["error"].get("code") == -32602,
+        detail=f"got code {resp['error'].get('code')}",
+    )
+
+# Unknown tool name
+resp = rpc("tools/call", {"name": "nonexistent_tool", "arguments": {}})
+check(
+    "unknown tool name returns JSON-RPC error",
+    "error" in resp,
+    detail=f"got result instead of error" if "error" not in resp else "",
+)
+
+# Invalid EBS volume type
+resp = rpc("tools/call", {"name": "estimate_ebs_monthly_cost", "arguments": {"volume_type": "fake_vol", "size_gb": 10}})
+check(
+    "invalid volume_type returns JSON-RPC error",
+    "error" in resp,
+    detail=f"got result instead of error" if "error" not in resp else "",
+)
+
+# Invalid S3 storage class
+resp = rpc("tools/call", {"name": "estimate_s3_monthly_cost", "arguments": {"storage_gb": 10, "storage_class": "BOGUS"}})
+check(
+    "invalid storage_class returns JSON-RPC error",
+    "error" in resp,
+    detail=f"got result instead of error" if "error" not in resp else "",
+)
+
+# recommend_instance with impossible requirements (vcpus=128, memory_gib=1024)
+resp = rpc("tools/call", {"name": "recommend_instance", "arguments": {"vcpus": 128, "memory_gib": 1024}})
+check(
+    "recommend_instance with impossible specs returns JSON-RPC error",
+    "error" in resp,
+    detail=f"got result instead of error" if "error" not in resp else "",
+)
+
+# Unknown JSON-RPC method
+resp = rpc("no/such/method", {})
+check(
+    "unknown JSON-RPC method returns error",
+    "error" in resp,
+    detail=f"got result instead of error" if "error" not in resp else "",
+)
+
+# ---------- Summary ----------
+
+total = passed + failed
+print(f"\n{'='*50}")
+print(f"Results: {passed}/{total} checks passed, {failed} failed")
+if failed:
+    sys.exit(1)
+else:
+    print("ACCEPTED")
+    sys.exit(0)

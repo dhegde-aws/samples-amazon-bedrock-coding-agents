@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AWS Cost Analyzer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <div class="header-inner">
+        <span class="header-logo">&#9749;</span>
+        <div>
+          <h1 class="header-title">AWS Cost Analyzer</h1>
+          <p class="header-subtitle">Powered by the cost-analyzer MCP server &mdash; no pricing logic runs here</p>
+        </div>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="tool-cards" id="toolCards">
+        <!-- Tool cards injected by app.js after tools/list -->
+      </div>
+
+      <div class="chat-window" id="chatWindow" aria-live="polite">
+        <div class="message assistant-message">
+          <div class="bubble">
+            <p>Hello! I can estimate AWS costs by calling the MCP server. Choose a tool above or type a query below.</p>
+            <p class="hint">Examples: &ldquo;m5.large &times; 2&rdquo;, &ldquo;100 GB gp3 EBS&rdquo;, &ldquo;recommend instance for 4 vCPU 16 GiB&rdquo;</p>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <form class="input-form" id="inputForm" autocomplete="off">
+        <input
+          type="text"
+          id="userInput"
+          class="input-field"
+          placeholder="Ask about AWS costs or sizing..."
+          aria-label="Ask about AWS costs"
+        />
+        <button type="submit" class="send-btn" id="sendBtn">Send</button>
+      </form>
+      <p class="footer-note">
+        All values come from
+        <code>tools/call</code> POST to
+        <span id="endpointDisplay" class="endpoint-tag">http://127.0.0.1:50851</span>
+        via <code>fetch()</code>
+      </p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
